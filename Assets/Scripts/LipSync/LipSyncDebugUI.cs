@@ -12,6 +12,8 @@ namespace ls
 
 		private string _jsonText = "";
 
+		private string[] _modeOptions;
+
 		private Vector2 _windowScroll;
 		private Vector2 _scheduleScroll;
 		private Rect _window = new Rect(20, 20, 460, 900);
@@ -33,6 +35,13 @@ namespace ls
 			{
 				_jsonText = manager.transcriptJson.text;
 			}
+
+			int modeLen = System.Enum.GetValues(typeof(LipSyncMode)).Length;
+			_modeOptions = new string[modeLen];
+			foreach (LipSyncMode m in System.Enum.GetValues(typeof(LipSyncMode)))
+			{
+				_modeOptions[(int)m] = m.ToString();
+			}
 		}
 
 		private void Update()
@@ -40,6 +49,22 @@ namespace ls
 			if (Keyboard.current.f1Key.wasPressedThisFrame)
 			{
 				visible = !visible;
+			}
+		}
+
+		private void OnDestroy()
+		{
+			if (_texGray != null)
+			{
+				Destroy(_texGray);
+			}
+			if (_texGreen != null)
+			{
+				Destroy(_texGreen);
+			}
+			if (_texHighlight != null)
+			{
+				Destroy(_texHighlight);
 			}
 		}
 
@@ -81,7 +106,7 @@ namespace ls
 
 			_jsonText = GUILayout.TextArea(_jsonText, GUILayout.MinHeight(80));
 
-			manager.useCMUDict = Toggle(manager.useCMUDict, " use CMU dictionary");
+			manager.mode = (LipSyncMode)Dropdown("Mode", (int)manager.mode, _modeOptions);
 			manager.jawApplyRatio = Slider("jaw", manager.jawApplyRatio, 0f, 1f);
 			manager.blendApplyRatio = Slider("blend", manager.blendApplyRatio, 0f, 1f);
 			manager.blendSpeed = Slider("blendSpeed", manager.blendSpeed, 0f, 100f);
@@ -230,6 +255,15 @@ namespace ls
 			value = GUILayout.HorizontalSlider(value, min, max);
 			GUILayout.EndHorizontal();
 			return value;
+		}
+
+		private int Dropdown(string label, int selectedIndex, string[] options)
+		{
+			GUILayout.BeginHorizontal();
+			GUILayout.Label(label, GUILayout.Width(130));
+			selectedIndex = GUILayout.SelectionGrid(selectedIndex, options, options.Length);
+			GUILayout.EndHorizontal();
+			return selectedIndex;
 		}
 
 		#endregion
