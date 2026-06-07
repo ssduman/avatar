@@ -1,7 +1,7 @@
 using UnityEditor;
 using UnityEngine;
 
-namespace Test2
+namespace ls
 {
 	[CustomEditor(typeof(LipSyncManager))]
 	public class LipSyncManagerEditor : Editor

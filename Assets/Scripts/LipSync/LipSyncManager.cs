@@ -3,7 +3,7 @@ using System.Text;
 using System.Collections;
 using System.Collections.Generic;
 
-namespace Test2
+namespace ls
 {
 	[System.Serializable]
 	public class TranscriptSegment
@@ -34,15 +34,31 @@ namespace Test2
 		}
 	}
 
+	[System.Serializable]
 	public struct VisemeKey
 	{
 		public string viseme;
 		public float time;
+		public string word;
+		public string phoneme;
+		public int wordIndex;
 
 		public VisemeKey(string viseme, float time)
 		{
 			this.viseme = viseme;
 			this.time = time;
+			this.word = "";
+			this.phoneme = "";
+			this.wordIndex = -1;
+		}
+
+		public VisemeKey(string viseme, float time, string word, string phoneme, int wordIndex)
+		{
+			this.viseme = viseme;
+			this.time = time;
+			this.word = word;
+			this.phoneme = phoneme;
+			this.wordIndex = wordIndex;
 		}
 
 		public override string ToString()
@@ -51,8 +67,71 @@ namespace Test2
 		}
 	}
 
+	[System.Serializable]
+	public struct VisemeSource
+	{
+		public string viseme;
+		public string word;
+		public string phoneme;
+		public int wordIndex;
+
+		public VisemeSource(string viseme, string word, string phoneme, int wordIndex)
+		{
+			this.viseme = viseme;
+			this.word = word;
+			this.phoneme = phoneme;
+			this.wordIndex = wordIndex;
+		}
+	}
+
+	public class LipSyncContext
+	{
+		// blendshape resolution
+		public float[] currentWeights;
+		public Dictionary<string, int> blendShapeIndex = new Dictionary<string, int>();
+		public Dictionary<string, string[]> cmuDict = new Dictionary<string, string[]>();
+		public int browIndex = -1;
+		public List<int> blinkIndices = new List<int>();
+
+		// head motion
+		public Quaternion headRestRot;
+		public bool hasHeadRest;
+		public float headAmp;
+		public float headTalkBlend;
+
+		// blink
+		public float nextBlinkTime;
+		public float blinkPhase = -1.0f;
+		public int extraBlinks;
+
+		// saccade
+		public float nextSaccadeTime;
+		public Vector2 saccadeCurrent;
+		public Vector2 saccadeTarget;
+
+		// jaw
+		public int jawIndex = -1;
+
+		// playback
+		public Coroutine playRoutine;
+		public float timer;
+		public List<VisemeKey> schedule = new List<VisemeKey>();
+		public List<string> words = new List<string>();
+		public float scheduleEnd;
+
+		// current-frame state
+		public int scheduleIndex = -1;
+		public string currentViseme;
+		public string nextViseme;
+		public float blendFactor;
+		public string currentWord = "";
+		public string currentPhoneme = "";
+		public int currentWordIndex = -1;
+	}
+
 	public class LipSyncManager : MonoBehaviour
 	{
+		[Header("Init")]
 		public SkinnedMeshRenderer targetRenderer;
 
 		public TextAsset cmuDictAsset;
@@ -65,7 +144,7 @@ namespace Test2
 		[Range(0.0f, 1.0f)] public float blendApplyRatio = 0.4f;
 		[Range(0.0f, 100.0f)] public float blendSpeed = 28.0f;
 
-		[Header("Brown")]
+		[Header("Brow")]
 		public bool enableBrowMotion = true;
 
 		[Header("Eye Blink")]
@@ -80,36 +159,7 @@ namespace Test2
 		[Range(0.0f, 10.0f)] public float headIdleAmplitude = 1.5f;
 		[Range(0.0f, 10.0f)] public float headTalkAmplitude = 3.5f;
 
-		[Header("Debug")]
-		public TMPro.TMP_Text timeText;
-
-		private float[] _currentWeights;
-		private Dictionary<string, int> _blendShapeIndex = new Dictionary<string, int>();
-		private Dictionary<string, string[]> _cmuDict = new Dictionary<string, string[]>();
-
-		private int _browIndex = -1;
-		private List<int> _blinkIndices = new List<int>();
-
-		private Quaternion _headRestRot;
-		private bool _hasHeadRest;
-
-		private float _nextBlinkTime;
-		private float _blinkPhase = -1.0f;
-		private int _pendingBlinks;
-		private const float BlinkCloseDur = 0.08f;
-		private const float BlinkHoldDur = 0.04f;
-		private const float BlinkOpenDur = 0.12f;
-
-		private float _nextSaccadeTime;
-		private Vector2 _saccadeCurrent;
-		private Vector2 _saccadeTarget;
-
-		private Coroutine _playRoutine;
-
-		private float _headAmp;
-		private float _headTalkBlend;
-
-		private float _timer;
+		private readonly LipSyncContext _ctx = new LipSyncContext();
 
 		private static readonly HashSet<string> OpenVowels = new HashSet<string>
 		{
@@ -119,8 +169,7 @@ namespace Test2
 		{
 			"sil", "pp", "ff", "th", "dd", "kk", "ch", "ss", "nn", "rr", "aa", "e", "ih", "oh", "ou",
 		};
-
-		private static readonly Dictionary<string, float> VisemeIntensity = new Dictionary<string, float>
+		private static readonly Dictionary<string, float> VisemeIntensities = new Dictionary<string, float>
 		{
 			{ "aa", 1.0f }, { "oh", 0.95f }, { "ou", 0.85f },
 			{ "e", 0.7f }, { "ih", 0.6f }, { "rr", 0.55f },
@@ -136,29 +185,46 @@ namespace Test2
 				return;
 			}
 
-			_nextBlinkTime = Time.time + Random.Range(blinkInterval.x, blinkInterval.y);
+			_ctx.nextBlinkTime = Time.time + Random.Range(blinkInterval.x, blinkInterval.y);
 
 			LoadCMUDict();
 			ResolveBlendShapes();
 			CacheBoneRests();
 		}
 
+		private void OnEnable()
+		{
+		}
+
+		private void OnDisable()
+		{
+			StopAllCoroutines();
+		}
+
 		private void Update()
 		{
-			if (_currentWeights == null)
+			if (_ctx.currentWeights == null)
+			{
+				return;
+			}
+		}
+
+		private void LateUpdate()
+		{
+			if (_ctx.currentWeights == null)
 			{
 				return;
 			}
 
-			if (enableBlink && _blinkIndices.Count > 0)
+			if (enableBlink && _ctx.blinkIndices.Count > 0)
 			{
 				UpdateBlink();
 			}
-			if (enableHeadMotion && _hasHeadRest)
+			if (enableHeadMotion && _ctx.hasHeadRest)
 			{
 				UpdateHead();
 			}
-			if (enableBrowMotion && _browIndex >= 0)
+			if (enableBrowMotion && _ctx.browIndex >= 0)
 			{
 				UpdateBrow();
 			}
@@ -174,7 +240,7 @@ namespace Test2
 				return;
 			}
 
-			_cmuDict.Clear();
+			_ctx.cmuDict.Clear();
 
 			char[] dictSplit = new char[] { ' ', '\t', '\r' };
 
@@ -206,32 +272,34 @@ namespace Test2
 					word = word.Substring(0, paren);
 				}
 
-				if (_cmuDict.ContainsKey(word))
+				if (_ctx.cmuDict.ContainsKey(word))
 				{
 					continue;
 				}
 
 				string[] phonemes = new string[tokens.Length - 1];
 				System.Array.Copy(tokens, 1, phonemes, 0, phonemes.Length);
-				_cmuDict[word] = phonemes;
+				_ctx.cmuDict[word] = phonemes;
 			}
 
-			Debug.Log($"[LipSync] Loaded {_cmuDict.Count} CMUdict entries. world: {string.Join(" ", _cmuDict["world"])}", this);
+			string sampleWord = "world";
+			string sample = _ctx.cmuDict.ContainsKey(sampleWord) ? string.Join(" ", _ctx.cmuDict[sampleWord]) : "(not found)";
+			Debug.Log($"[LipSync] Loaded {_ctx.cmuDict.Count} CMUdict entries. {sampleWord}: {sample}", this);
 		}
 
 		private void ResolveBlendShapes()
 		{
 			Mesh mesh = targetRenderer.sharedMesh;
 
-			_browIndex = -1;
-			_blendShapeIndex.Clear();
-			_blinkIndices.Clear();
+			_ctx.browIndex = -1;
+			_ctx.blendShapeIndex.Clear();
+			_ctx.blinkIndices.Clear();
 
-			_currentWeights = new float[mesh.blendShapeCount];
+			_ctx.currentWeights = new float[mesh.blendShapeCount];
 
 			for (int i = 0; i < mesh.blendShapeCount; i++)
 			{
-				_currentWeights[i] = targetRenderer.GetBlendShapeWeight(i);
+				_ctx.currentWeights[i] = targetRenderer.GetBlendShapeWeight(i);
 
 				string full = mesh.GetBlendShapeName(i);
 				string key = ShortName(full);
@@ -240,25 +308,26 @@ namespace Test2
 				{
 					if (key == v)
 					{
-						_blendShapeIndex[v] = i;
+						_ctx.blendShapeIndex[v] = i;
 					}
 				}
 
-				if (key.StartsWith("jawopen") && !_blendShapeIndex.ContainsKey("jaw"))
+				if (key.StartsWith("jawopen") && !_ctx.blendShapeIndex.ContainsKey("jaw"))
 				{
-					_blendShapeIndex["jaw"] = i;
+					_ctx.jawIndex = i;
+					_ctx.blendShapeIndex["jaw"] = i;
 				}
 				if (key.Contains("blink") || key.Contains("eyesclosed") || key.Contains("eyeclose"))
 				{
-					_blinkIndices.Add(i);
+					_ctx.blinkIndices.Add(i);
 				}
-				if (_browIndex < 0 && key.Contains("brow") && (key.Contains("up") || key.Contains("raise")))
+				if (_ctx.browIndex < 0 && key.Contains("brow") && (key.Contains("up") || key.Contains("raise")))
 				{
-					_browIndex = i;
+					_ctx.browIndex = i;
 				}
 			}
 
-			if (enableBlink && _blinkIndices.Count == 0)
+			if (enableBlink && _ctx.blinkIndices.Count == 0)
 			{
 				Debug.LogWarning("[LipSync] enableBlink is on but no blink blendshape found (looked for 'blink'/'eyesclosed').", this);
 			}
@@ -266,7 +335,7 @@ namespace Test2
 			List<string> missing = new List<string>();
 			foreach (string v in VisemeKeys)
 			{
-				if (!_blendShapeIndex.ContainsKey(v))
+				if (!_ctx.blendShapeIndex.ContainsKey(v))
 				{
 					missing.Add(v);
 				}
@@ -276,7 +345,9 @@ namespace Test2
 				Debug.LogWarning($"[LipSync] Mesh missing visemes (will be skipped): {string.Join(", ", missing)}", this);
 			}
 
-			Debug.Log($"[LipSync] Resolved {_blendShapeIndex.Count} viseme/jaw blendshapes on '{mesh.name}'.", this);
+			_ctx.blendShapeIndex.TryGetValue("jaw", out _ctx.jawIndex);
+
+			Debug.Log($"[LipSync] Resolved {_ctx.blendShapeIndex.Count} viseme/jaw blendshapes on '{mesh.name}'.", this);
 		}
 
 		private string ShortName(string full)
@@ -290,10 +361,10 @@ namespace Test2
 		{
 			if (headBone != null)
 			{
-				_headRestRot = headBone.localRotation;
-				_hasHeadRest = true;
-				_headAmp = headIdleAmplitude;
-				_headTalkBlend = 0.0f;
+				_ctx.headRestRot = headBone.localRotation;
+				_ctx.hasHeadRest = true;
+				_ctx.headAmp = headIdleAmplitude;
+				_ctx.headTalkBlend = 0.0f;
 			}
 		}
 
@@ -309,13 +380,23 @@ namespace Test2
 				return;
 			}
 
-			_timer = 0.0f;
-			timeText.SetText($"time: {_timer:F2}");
+			Play(transcriptJson.text);
+		}
+
+		public void Play(string json)
+		{
+			if (string.IsNullOrEmpty(json))
+			{
+				Debug.LogWarning("[LipSync] Empty transcript JSON.", this);
+				return;
+			}
+
+			_ctx.timer = 0.0f;
 
 			Transcript transcript;
 			try
 			{
-				transcript = JsonUtility.FromJson<Transcript>(transcriptJson.text);
+				transcript = JsonUtility.FromJson<Transcript>(json);
 				if (transcript == null || transcript.segments == null || transcript.segments.Length == 0)
 				{
 					Debug.LogWarning("[LipSync] Transcript has no segments.", this);
@@ -334,20 +415,23 @@ namespace Test2
 				return;
 			}
 
-			if (_playRoutine != null)
+			_ctx.schedule = schedule;
+			_ctx.scheduleEnd = schedule[schedule.Count - 1].time;
+
+			if (_ctx.playRoutine != null)
 			{
-				StopCoroutine(_playRoutine);
+				StopCoroutine(_ctx.playRoutine);
 			}
 
-			_playRoutine = StartCoroutine(PlayRoutine(schedule));
+			_ctx.playRoutine = StartCoroutine(PlayRoutine(schedule));
 		}
 
 		public void Stop()
 		{
-			if (_playRoutine != null)
+			if (_ctx.playRoutine != null)
 			{
-				StopCoroutine(_playRoutine);
-				_playRoutine = null;
+				StopCoroutine(_ctx.playRoutine);
+				_ctx.playRoutine = null;
 			}
 
 			StartCoroutine(EaseToRest());
@@ -362,8 +446,7 @@ namespace Test2
 
 			while (true)
 			{
-				_timer += Time.deltaTime;
-				timeText.SetText($"time: {_timer:F2}");
+				_ctx.timer += Time.deltaTime;
 
 				float t = Time.time - startTime;
 
@@ -373,16 +456,27 @@ namespace Test2
 				}
 
 				VisemeKey cur = schedule[index];
+
+				_ctx.scheduleIndex = index;
+				_ctx.currentViseme = cur.viseme;
+				_ctx.currentWord = cur.word;
+				_ctx.currentPhoneme = cur.phoneme;
+				_ctx.currentWordIndex = cur.wordIndex;
+
 				if (index < schedule.Count - 1)
 				{
 					VisemeKey next = schedule[index + 1];
 					float span = next.time - cur.time;
 					float f = span > 0.0001f ? Mathf.Clamp01((t - cur.time) / span) : 1.0f;
 					f = f * f * (3.0f - 2.0f * f);
+					_ctx.nextViseme = next.viseme;
+					_ctx.blendFactor = f;
 					ApplyTargets(cur.viseme, 1.0f - f, next.viseme, f);
 				}
 				else
 				{
+					_ctx.nextViseme = null;
+					_ctx.blendFactor = 0.0f;
 					ApplyTargets(cur.viseme, 1.0f, null, 0.0f);
 				}
 
@@ -394,12 +488,19 @@ namespace Test2
 				yield return null;
 			}
 
-			_playRoutine = null;
+			_ctx.scheduleIndex = -1;
+			_ctx.currentViseme = null;
+			_ctx.nextViseme = null;
+			_ctx.currentWord = "";
+			_ctx.currentPhoneme = "";
+			_ctx.currentWordIndex = -1;
+			_ctx.blendFactor = 0.0f;
+			_ctx.playRoutine = null;
 		}
 
 		private bool IsTalking()
 		{
-			return _playRoutine != null;
+			return _ctx.playRoutine != null;
 		}
 
 		#endregion
@@ -409,7 +510,9 @@ namespace Test2
 		private List<VisemeKey> BuildSchedule(Transcript transcript)
 		{
 			List<VisemeKey> keys = new List<VisemeKey>();
+			_ctx.words.Clear();
 			float prevEnd = 0.0f;
+			int wordCounter = 0;
 
 			foreach (TranscriptSegment seg in transcript.segments)
 			{
@@ -426,7 +529,7 @@ namespace Test2
 					keys.Add(new VisemeKey("sil", prevEnd));
 				}
 
-				List<string> visemes = TextToVisemes(seg.text);
+				List<VisemeSource> visemes = TextToVisemes(seg.text, ref wordCounter);
 				if (visemes.Count == 0)
 				{
 					keys.Add(new VisemeKey("sil", start));
@@ -437,7 +540,8 @@ namespace Test2
 					float step = duration / visemes.Count;
 					for (int i = 0; i < visemes.Count; i++)
 					{
-						keys.Add(new VisemeKey(visemes[i], start + i * step));
+						VisemeSource vs = visemes[i];
+						keys.Add(new VisemeKey(vs.viseme, start + i * step, vs.word, vs.phoneme, vs.wordIndex));
 					}
 				}
 
@@ -445,6 +549,18 @@ namespace Test2
 			}
 
 			keys.Add(new VisemeKey("sil", prevEnd));
+
+			// flat word list (in order) for the highlight UI
+			_ctx.words.Clear();
+			int expected = 0;
+			foreach (VisemeKey k in keys)
+			{
+				if (k.wordIndex == expected && !string.IsNullOrEmpty(k.word))
+				{
+					_ctx.words.Add(k.word);
+					expected++;
+				}
+			}
 
 			StringBuilder sbVisemes = new StringBuilder();
 			foreach (VisemeKey k in keys)
@@ -460,9 +576,9 @@ namespace Test2
 
 		#region viseme
 
-		private List<string> TextToVisemes(string text)
+		private List<VisemeSource> TextToVisemes(string text, ref int wordCounter)
 		{
-			List<string> result = new List<string>();
+			List<VisemeSource> result = new List<VisemeSource>();
 			if (string.IsNullOrEmpty(text))
 			{
 				return result;
@@ -479,57 +595,59 @@ namespace Test2
 					continue;
 				}
 
-				if (useCMUDict && _cmuDict != null && _cmuDict.TryGetValue(word, out string[] phonemes))
+				int wordIndex = wordCounter++;
+
+				if (useCMUDict && _ctx.cmuDict != null && _ctx.cmuDict.TryGetValue(word, out string[] phonemes))
 				{
 					foreach (string ph in phonemes)
 					{
-						AppendPhonemeViseme(ph, result);
+						AppendPhonemeViseme(ph, result, word, wordIndex);
 					}
 				}
 				else
 				{
-					AppendWordVisemesByRules(word, result);
+					AppendWordVisemesByRules(word, result, wordIndex);
 				}
 
 				// brief mouth close between words (not after the last word)
 				if (w < words.Length - 1)
 				{
-					AddViseme(result, "sil");
+					AddViseme(result, "sil", "", "", -1);
 				}
 			}
 
 			return result;
 		}
 
-		private void AppendPhonemeViseme(string phoneme, List<string> result)
+		private void AppendPhonemeViseme(string phoneme, List<VisemeSource> result, string word, int wordIndex)
 		{
 			string p = phoneme.TrimEnd('0', '1', '2');
 			switch (p)
 			{
 				// diphthongs -> two shapes
-				case "AW": AddViseme(result, "aa"); AddViseme(result, "ou"); return; // how
-				case "AY": AddViseme(result, "aa"); AddViseme(result, "ih"); return; // my
-				case "OY": AddViseme(result, "oh"); AddViseme(result, "ih"); return; // boy
-				case "EY": AddViseme(result, "e"); AddViseme(result, "ih"); return; // say
-				case "OW": AddViseme(result, "oh"); return; // go
+				case "AW": AddViseme(result, "aa", word, p, wordIndex); AddViseme(result, "ou", word, p, wordIndex); return; // how
+				case "AY": AddViseme(result, "aa", word, p, wordIndex); AddViseme(result, "ih", word, p, wordIndex); return; // my
+				case "OY": AddViseme(result, "oh", word, p, wordIndex); AddViseme(result, "ih", word, p, wordIndex); return; // boy
+				case "EY": AddViseme(result, "e", word, p, wordIndex); AddViseme(result, "ih", word, p, wordIndex); return; // say
+				case "OW": AddViseme(result, "oh", word, p, wordIndex); return; // go
 
 				// monophthong vowels
-				case "AA": case "AO": case "AE": case "AH": case "AX": AddViseme(result, "aa"); return;
-				case "EH": case "ER": AddViseme(result, "e"); return;
-				case "IH": case "IY": AddViseme(result, "ih"); return;
-				case "UH": case "UW": AddViseme(result, "ou"); return;
+				case "AA": case "AO": case "AE": case "AH": case "AX": AddViseme(result, "aa", word, p, wordIndex); return;
+				case "EH": case "ER": AddViseme(result, "e", word, p, wordIndex); return;
+				case "IH": case "IY": AddViseme(result, "ih", word, p, wordIndex); return;
+				case "UH": case "UW": AddViseme(result, "ou", word, p, wordIndex); return;
 
 				// consonants
-				case "P": case "B": case "M": AddViseme(result, "pp"); return;
-				case "F": case "V": AddViseme(result, "ff"); return;
-				case "TH": case "DH": AddViseme(result, "th"); return;
-				case "T": case "D": case "L": case "DX": AddViseme(result, "dd"); return;
-				case "N": AddViseme(result, "nn"); return;
-				case "NG": AddViseme(result, "nn"); return;
-				case "K": case "G": AddViseme(result, "kk"); return;
-				case "CH": case "JH": case "SH": case "ZH": AddViseme(result, "ch"); return;
-				case "S": case "Z": AddViseme(result, "ss"); return;
-				case "R": AddViseme(result, "rr"); return;
+				case "P": case "B": case "M": AddViseme(result, "pp", word, p, wordIndex); return;
+				case "F": case "V": AddViseme(result, "ff", word, p, wordIndex); return;
+				case "TH": case "DH": AddViseme(result, "th", word, p, wordIndex); return;
+				case "T": case "D": case "L": case "DX": AddViseme(result, "dd", word, p, wordIndex); return;
+				case "N": AddViseme(result, "nn", word, p, wordIndex); return;
+				case "NG": AddViseme(result, "nn", word, p, wordIndex); return;
+				case "K": case "G": AddViseme(result, "kk", word, p, wordIndex); return;
+				case "CH": case "JH": case "SH": case "ZH": AddViseme(result, "ch", word, p, wordIndex); return;
+				case "S": case "Z": AddViseme(result, "ss", word, p, wordIndex); return;
+				case "R": AddViseme(result, "rr", word, p, wordIndex); return;
 
 				// glides / aspirate -> no viseme
 				case "Y": case "W": case "HH": return;
@@ -538,7 +656,7 @@ namespace Test2
 			}
 		}
 
-		private void AppendWordVisemesByRules(string word, List<string> result)
+		private void AppendWordVisemesByRules(string word, List<VisemeSource> result, int wordIndex)
 		{
 			int i = 0;
 			while (i < word.Length)
@@ -549,26 +667,26 @@ namespace Test2
 				bool isLast = i == word.Length - 1;
 
 				// consonant digraphs (checked first so 'wh'/'qu' win over glide/vowel rules)
-				if (c == 't' && next == 'h') { AddViseme(result, "th"); i += 2; continue; }
-				if (c == 's' && next == 'h') { AddViseme(result, "ch"); i += 2; continue; }
-				if (c == 'c' && next == 'h') { AddViseme(result, "ch"); i += 2; continue; }
-				if (c == 'p' && next == 'h') { AddViseme(result, "ff"); i += 2; continue; }
-				if (c == 'n' && next == 'g') { AddViseme(result, "nn"); i += 2; continue; }
-				if (c == 'c' && next == 'k') { AddViseme(result, "kk"); i += 2; continue; }
-				if (c == 'q' && next == 'u') { AddViseme(result, "kk"); AddViseme(result, "ou"); i += 2; continue; }
-				if (c == 'w' && next == 'h') { AddViseme(result, "ou"); i += 2; continue; }
+				if (c == 't' && next == 'h') { AddViseme(result, "th", word, "th", wordIndex); i += 2; continue; }
+				if (c == 's' && next == 'h') { AddViseme(result, "ch", word, "sh", wordIndex); i += 2; continue; }
+				if (c == 'c' && next == 'h') { AddViseme(result, "ch", word, "ch", wordIndex); i += 2; continue; }
+				if (c == 'p' && next == 'h') { AddViseme(result, "ff", word, "ph", wordIndex); i += 2; continue; }
+				if (c == 'n' && next == 'g') { AddViseme(result, "nn", word, "ng", wordIndex); i += 2; continue; }
+				if (c == 'c' && next == 'k') { AddViseme(result, "kk", word, "ck", wordIndex); i += 2; continue; }
+				if (c == 'q' && next == 'u') { AddViseme(result, "kk", word, "qu", wordIndex); AddViseme(result, "ou", word, "qu", wordIndex); i += 2; continue; }
+				if (c == 'w' && next == 'h') { AddViseme(result, "ou", word, "wh", wordIndex); i += 2; continue; }
 
 				// vowel digraphs / diphthongs (map to the dominant mouth shape)
-				if (c == 'o' && next == 'w') { AddViseme(result, "ou"); i += 2; continue; } // how, now
-				if (c == 'o' && next == 'u') { AddViseme(result, "ou"); i += 2; continue; } // you, soup
-				if (c == 'o' && next == 'o') { AddViseme(result, "ou"); i += 2; continue; } // food, moon
-				if (c == 'o' && next == 'a') { AddViseme(result, "oh"); i += 2; continue; } // boat
-				if (c == 'o' && (next == 'i' || next == 'y')) { AddViseme(result, "oh"); AddViseme(result, "ih"); i += 2; continue; } // boy, coin
-				if (c == 'e' && (next == 'e' || next == 'a' || next == 'i')) { AddViseme(result, "e"); i += 2; continue; } // see, eat, vein
-				if (c == 'a' && (next == 'i' || next == 'y')) { AddViseme(result, "e"); i += 2; continue; } // rain, day
-				if (c == 'a' && (next == 'u' || next == 'w')) { AddViseme(result, "aa"); i += 2; continue; } // saw, caught
-				if (c == 'u' && next == 'e') { AddViseme(result, "ou"); i += 2; continue; } // blue, true
-				if (c == 'i' && next == 'e') { AddViseme(result, "ih"); i += 2; continue; } // pie, tie
+				if (c == 'o' && next == 'w') { AddViseme(result, "ou", word, "ow", wordIndex); i += 2; continue; } // how, now
+				if (c == 'o' && next == 'u') { AddViseme(result, "ou", word, "ou", wordIndex); i += 2; continue; } // you, soup
+				if (c == 'o' && next == 'o') { AddViseme(result, "ou", word, "oo", wordIndex); i += 2; continue; } // food, moon
+				if (c == 'o' && next == 'a') { AddViseme(result, "oh", word, "oa", wordIndex); i += 2; continue; } // boat
+				if (c == 'o' && (next == 'i' || next == 'y')) { AddViseme(result, "oh", word, "oi", wordIndex); AddViseme(result, "ih", word, "oi", wordIndex); i += 2; continue; } // boy, coin
+				if (c == 'e' && (next == 'e' || next == 'a' || next == 'i')) { AddViseme(result, "e", word, "e" + next, wordIndex); i += 2; continue; } // see, eat, vein
+				if (c == 'a' && (next == 'i' || next == 'y')) { AddViseme(result, "e", word, "a" + next, wordIndex); i += 2; continue; } // rain, day
+				if (c == 'a' && (next == 'u' || next == 'w')) { AddViseme(result, "aa", word, "a" + next, wordIndex); i += 2; continue; } // saw, caught
+				if (c == 'u' && next == 'e') { AddViseme(result, "ou", word, "ue", wordIndex); i += 2; continue; } // blue, true
+				if (c == 'i' && next == 'e') { AddViseme(result, "ih", word, "ie", wordIndex); i += 2; continue; } // pie, tie
 
 				// leading glide y/w: consonant onset, no viseme of its own (you, we)
 				if (i == 0 && (c == 'y' || c == 'w') && word.Length > 1) { i++; continue; }
@@ -580,7 +698,7 @@ namespace Test2
 				string v = LetterToViseme(c);
 				if (!string.IsNullOrEmpty(v))
 				{
-					AddViseme(result, v);
+					AddViseme(result, v, word, c.ToString(), wordIndex);
 				}
 
 				i++;
@@ -634,13 +752,13 @@ namespace Test2
 			}
 		}
 
-		private void AddViseme(List<string> list, string v)
+		private void AddViseme(List<VisemeSource> list, string v, string word, string phoneme, int wordIndex)
 		{
-			if (list.Count > 0 && list[list.Count - 1] == v)
+			if (list.Count > 0 && list[list.Count - 1].viseme == v)
 			{
 				return;
 			}
-			list.Add(v);
+			list.Add(new VisemeSource(v, word, phoneme, wordIndex));
 		}
 
 		private string[] SplitWords(string lower)
@@ -672,23 +790,37 @@ namespace Test2
 			shapeB *= weightB;
 
 			float jawWeight = 0.0f;
-			if (visemeA != null && OpenVowels.Contains(visemeA))
+			float jawIntensity = 1.0f;
+			if (visemeA != null)
 			{
-				jawWeight = Mathf.Max(jawWeight, weightA);
+				if (OpenVowels.Contains(visemeA))
+				{
+					jawWeight = Mathf.Max(jawWeight, weightA);
+				}
+				if (VisemeIntensities.ContainsKey(visemeA))
+				{
+					jawIntensity = VisemeIntensities[visemeA];
+				}
 			}
 
-			if (visemeB != null && OpenVowels.Contains(visemeB))
+			if (visemeB != null)
 			{
-				jawWeight = Mathf.Max(jawWeight, weightB);
+				if (OpenVowels.Contains(visemeB))
+				{
+					jawWeight = Mathf.Max(jawWeight, weightB);
+				}
+				if (VisemeIntensities.ContainsKey(visemeB))
+				{
+					jawIntensity = VisemeIntensities[visemeB];
+				}
 			}
 
-			int jawIndex = _blendShapeIndex.TryGetValue("jaw", out int ji) ? ji : -1;
-			float jawTarget = jawWeight * jawApplyRatio * 100.0f;
+			float jawTarget = jawWeight * jawIntensity * jawApplyRatio * 100.0f;
 
 			float scaleA = shapeA * blendApplyRatio * 100.0f;
 			float scaleB = shapeB * blendApplyRatio * 100.0f;
 
-			for (int i = 0; i < _currentWeights.Length; i++)
+			for (int i = 0; i < _ctx.currentWeights.Length; i++)
 			{
 				float target = 0.0f;
 				if (i == idxA)
@@ -699,20 +831,20 @@ namespace Test2
 				{
 					target = Mathf.Max(target, scaleB);
 				}
-				if (i == jawIndex)
+				if (i == _ctx.jawIndex)
 				{
 					target = Mathf.Max(target, jawTarget);
 				}
 
-				if (!Mathf.Approximately(_currentWeights[i], target))
+				if (!Mathf.Approximately(_ctx.currentWeights[i], target))
 				{
 					float step = Mathf.Clamp01(dt);
-					_currentWeights[i] = Mathf.Lerp(_currentWeights[i], target, step);
-					if (Mathf.Abs(_currentWeights[i] - target) < 0.05f)
+					_ctx.currentWeights[i] = Mathf.Lerp(_ctx.currentWeights[i], target, step);
+					if (Mathf.Abs(_ctx.currentWeights[i] - target) < 0.05f)
 					{
-						_currentWeights[i] = target;
+						_ctx.currentWeights[i] = target;
 					}
-					targetRenderer.SetBlendShapeWeight(i, _currentWeights[i]);
+					targetRenderer.SetBlendShapeWeight(i, _ctx.currentWeights[i]);
 				}
 			}
 		}
@@ -724,9 +856,9 @@ namespace Test2
 			{
 				return -1;
 			}
-			if (_blendShapeIndex.TryGetValue(viseme, out int idx))
+			if (_ctx.blendShapeIndex.TryGetValue(viseme, out int idx))
 			{
-				shape = VisemeIntensity.TryGetValue(viseme, out float v) ? v : 0.5f;
+				shape = VisemeIntensities.TryGetValue(viseme, out float v) ? v : 0.5f;
 				return idx;
 			}
 			return -1;
@@ -734,9 +866,9 @@ namespace Test2
 
 		private bool WeightsSettled()
 		{
-			for (int i = 0; i < _currentWeights.Length; i++)
+			for (int i = 0; i < _ctx.currentWeights.Length; i++)
 			{
-				if (_currentWeights[i] > 0.5f)
+				if (_ctx.currentWeights[i] > 0.5f)
 				{
 					return false;
 				}
@@ -761,63 +893,69 @@ namespace Test2
 		{
 			float amp = IsTalking() ? 25.0f : 6.0f;
 			float n = Mathf.PerlinNoise(Time.time * 0.5f, 7.3f);
-			targetRenderer.SetBlendShapeWeight(_browIndex, n * amp);
+			_ctx.currentWeights[_ctx.browIndex] = amp * n;
+			targetRenderer.SetBlendShapeWeight(_ctx.browIndex, _ctx.currentWeights[_ctx.browIndex]);
 		}
 
 		private void UpdateBlink()
 		{
-			if (_blinkIndices.Count == 0)
+			const float BlinkCloseDur = 0.08f;
+			const float BlinkHoldDur = 0.04f;
+			const float BlinkOpenDur = 0.12f;
+
+			if (_ctx.blinkIndices.Count == 0)
 			{
 				return;
 			}
 
-			if (_blinkPhase < 0.0f && Time.time >= _nextBlinkTime)
+			if (_ctx.blinkPhase < 0.0f && Time.time >= _ctx.nextBlinkTime)
 			{
-				_blinkPhase = 0.0f;
-				_pendingBlinks = Random.value < doubleBlinkChance ? 1 : 0;
+				_ctx.blinkPhase = 0.0f;
+				_ctx.extraBlinks = Random.value < doubleBlinkChance ? 1 : 0;
 			}
 
-			if (_blinkPhase < 0.0f)
+			if (_ctx.blinkPhase < 0.0f)
 			{
 				return;
 			}
 
-			_blinkPhase += Time.deltaTime;
+			_ctx.blinkPhase += Time.deltaTime;
 
 			float total = BlinkCloseDur + BlinkHoldDur + BlinkOpenDur;
 
 			float weight;
-			if (_blinkPhase < BlinkCloseDur)
+			if (_ctx.blinkPhase < BlinkCloseDur)
 			{
-				weight = _blinkPhase / BlinkCloseDur;
+				weight = _ctx.blinkPhase / BlinkCloseDur;
 			}
-			else if (_blinkPhase < BlinkCloseDur + BlinkHoldDur)
+			else if (_ctx.blinkPhase < BlinkCloseDur + BlinkHoldDur)
 			{
 				weight = 1.0f;
 			}
-			else if (_blinkPhase < total)
+			else if (_ctx.blinkPhase < total)
 			{
-				weight = 1.0f - (_blinkPhase - BlinkCloseDur - BlinkHoldDur) / BlinkOpenDur;
+				weight = 1.0f - (_ctx.blinkPhase - BlinkCloseDur - BlinkHoldDur) / BlinkOpenDur;
 			}
 			else
 			{
 				weight = 0.0f;
-				_blinkPhase = -1.0f;
-				if (_pendingBlinks > 0)
+				_ctx.blinkPhase = -1.0f;
+				if (_ctx.extraBlinks > 0)
 				{
-					_pendingBlinks--;
-					_nextBlinkTime = Time.time + 0.12f;
+					_ctx.extraBlinks--;
+					_ctx.nextBlinkTime = Time.time + 0.12f;
 				}
 				else
 				{
-					_nextBlinkTime = Time.time + Random.Range(blinkInterval.x, blinkInterval.y);
+					_ctx.nextBlinkTime = Time.time + Random.Range(blinkInterval.x, blinkInterval.y);
 				}
 			}
 
 			float w = Mathf.Clamp01(weight) * 100.0f;
-			for (int i = 0; i < _blinkIndices.Count; i++)
+			for (int i = 0; i < _ctx.blinkIndices.Count; i++)
 			{
-				targetRenderer.SetBlendShapeWeight(_blinkIndices[i], w);
+				_ctx.currentWeights[_ctx.blinkIndices[i]] = w;
+				targetRenderer.SetBlendShapeWeight(_ctx.blinkIndices[i], w);
 			}
 		}
 
@@ -825,18 +963,27 @@ namespace Test2
 		{
 			float targetAmp = IsTalking() ? headTalkAmplitude : headIdleAmplitude;
 			float targetBlend = IsTalking() ? 1.0f : 0.0f;
-			_headAmp = Mathf.Lerp(_headAmp, targetAmp, Mathf.Clamp01(Time.deltaTime * 4.0f));
-			_headTalkBlend = Mathf.Lerp(_headTalkBlend, targetBlend, Mathf.Clamp01(Time.deltaTime * 4.0f));
-			float amp = _headAmp;
+			_ctx.headAmp = Mathf.Lerp(_ctx.headAmp, targetAmp, Mathf.Clamp01(Time.deltaTime * 4.0f));
+			_ctx.headTalkBlend = Mathf.Lerp(_ctx.headTalkBlend, targetBlend, Mathf.Clamp01(Time.deltaTime * 4.0f));
+			float amp = _ctx.headAmp;
 			float tt = Time.time * headFrequency;
 
 			float pitch = (Mathf.PerlinNoise(tt, 0.0f) - 0.5f) * 2.0f * amp;
 			float yaw = (Mathf.PerlinNoise(0.0f, tt + 13.7f) - 0.5f) * 2.0f * amp;
 			float roll = (Mathf.PerlinNoise(tt + 31.2f, tt) - 0.5f) * 2.0f * amp * 0.5f;
 
-			pitch += Mathf.Sin(Time.time * 1.7f) * amp * 0.25f * _headTalkBlend;
+			pitch += Mathf.Sin(Time.time * 1.7f) * amp * 0.25f * _ctx.headTalkBlend;
 
-			headBone.localRotation = _headRestRot * Quaternion.Euler(pitch, yaw, roll);
+			headBone.localRotation = _ctx.headRestRot * Quaternion.Euler(pitch, yaw, roll);
+		}
+
+		#endregion
+
+		#region utils
+
+		public LipSyncContext GetContext()
+		{
+			return _ctx;
 		}
 
 		#endregion
